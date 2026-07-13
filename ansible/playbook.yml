@@ -1,0 +1,315 @@
+---
+- name: Configure PHP Laravel application server
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dest: /var/www/html
+    php_version: "8.3"
+    nginx_user: www-data
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+    - name: Restart php-fpm
+      ansible.builtin.service:
+        name: "php{{ php_version }}-fpm"
+        state: restarted
+
+  tasks:
+    #  1. System prerequisites 
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - unzip
+          - git
+        state: present
+
+    #  2. Add Ondej Sur PHP PPA for PHP 8.3 
+    - name: Add Ondrej PHP PPA signing key
+      ansible.builtin.apt_key:
+        url: https://packages.sury.org/php/apt.gpg
+        state: present
+
+    - name: Add Ondrej PHP PPA repository
+      ansible.builtin.apt_repository:
+        repo: "deb https://packages.sury.org/php/ {{ ansible_distribution_release }} main"
+        state: present
+        filename: php
+        update_cache: true
+
+    #  3. Install Nginx 
+    - name: Install Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Enable and start Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    #  4. Install PHP 8.3 and required extensions 
+    - name: Install PHP 8.3 and extensions
+      ansible.builtin.apt:
+        name:
+          - "php{{ php_version }}-fpm"
+          - "php{{ php_version }}-cli"
+          - "php{{ php_version }}-common"
+          - "php{{ php_version }}-mbstring"
+          - "php{{ php_version }}-xml"
+          - "php{{ php_version }}-bcmath"
+          - "php{{ php_version }}-curl"
+          - "php{{ php_version }}-zip"
+          - "php{{ php_version }}-tokenizer"
+          - "php{{ php_version }}-json"
+          - "php{{ php_version }}-pdo"
+        state: present
+      notify: Restart php-fpm
+
+    #  5. Ensure PHP-FPM starts BEFORE Nginx depends on it 
+    - name: Enable and start PHP-FPM
+      ansible.builtin.service:
+        name: "php{{ php_version }}-fpm"
+        state: started
+        enabled: true
+
+    #  6. Install Composer 
+    - name: Download Composer installer
+      ansible.builtin.get_url:
+        url: https://getcomposer.org/installer
+        dest: /tmp/composer-setup.php
+        mode: "0644"
+
+    - name: Install Composer globally
+      ansible.builtin.command:
+        cmd: "php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer"
+        creates: /usr/local/bin/composer
+
+    #  7. Prepare document root 
+    - name: Remove default Nginx document root content
+      ansible.builtin.file:
+        path: "{{ app_dest }}"
+        state: absent
+
+    - name: Create document root directory
+      ansible.builtin.file:
+        path: "{{ app_dest }}"
+        state: directory
+        owner: "{{ nginx_user }}"
+        group: "{{ nginx_user }}"
+        mode: "0755"
+
+    #  8. Sync application source code 
+    - name: Sync application source to server
+      ansible.posix.synchronize:
+        src: "{{ app_src }}/"
+        dest: "{{ app_dest }}/"
+        delete: true
+        recursive: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=node_modules"
+          - "--exclude=.env"
+          - "--exclude=.github"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+
+    #  9. Install Composer dependencies 
+    - name: Install Composer dependencies (production)
+      ansible.builtin.command:
+        cmd: composer install --no-dev --no-interaction --optimize-autoloader --no-progress
+        chdir: "{{ app_dest }}"
+      environment:
+        COMPOSER_ALLOW_SUPERUSER: "1"
+
+    #  10. Create Laravel .env file 
+    - name: Check if .env file exists
+      ansible.builtin.stat:
+        path: "{{ app_dest }}/.env"
+      register: env_file
+
+    - name: Create .env from .env.example if it does not exist
+      ansible.builtin.shell:
+        cmd: cp .env.example .env
+        chdir: "{{ app_dest }}"
+      when: not env_file.stat.exists
+      args:
+        creates: "{{ app_dest }}/.env"
+
+    - name: Ensure APP_ENV is production in .env
+      ansible.builtin.shell: |
+        if grep -q '^APP_ENV=' {{ app_dest }}/.env; then
+          sed -i 's/^APP_ENV=.*/APP_ENV=production/' {{ app_dest }}/.env
+        else
+          echo 'APP_ENV=production' >> {{ app_dest }}/.env
+        fi
+
+    - name: Ensure APP_DEBUG is false in .env
+      ansible.builtin.shell: |
+        if grep -q '^APP_DEBUG=' {{ app_dest }}/.env; then
+          sed -i 's/^APP_DEBUG=.*/APP_DEBUG=false/' {{ app_dest }}/.env
+        else
+          echo 'APP_DEBUG=false' >> {{ app_dest }}/.env
+        fi
+
+    - name: Generate Laravel application key if not set
+      ansible.builtin.shell:
+        cmd: php artisan key:generate --force
+        chdir: "{{ app_dest }}"
+      environment:
+        APP_ENV: production
+
+    #  11. Create required Laravel directories 
+    - name: Ensure Laravel storage directories exist
+      ansible.builtin.file:
+        path: "{{ app_dest }}/{{ item }}"
+        state: directory
+        owner: "{{ nginx_user }}"
+        group: "{{ nginx_user }}"
+        mode: "0775"
+      loop:
+        - storage
+        - storage/app
+        - storage/app/public
+        - storage/framework
+        - storage/framework/cache
+        - storage/framework/cache/data
+        - storage/framework/sessions
+        - storage/framework/testing
+        - storage/framework/views
+        - storage/logs
+        - bootstrap/cache
+
+    #  12. Set ownership and permissions 
+    - name: Set ownership of application directory
+      ansible.builtin.file:
+        path: "{{ app_dest }}"
+        state: directory
+        owner: "{{ nginx_user }}"
+        group: "{{ nginx_user }}"
+        recurse: true
+        mode: "0755"
+
+    - name: Set permissions on storage and bootstrap/cache
+      ansible.builtin.shell: |
+        find {{ app_dest }}/storage -type f -exec chmod 664 {} \;
+        find {{ app_dest }}/storage -type d -exec chmod 775 {} \;
+        find {{ app_dest }}/bootstrap/cache -type f -exec chmod 664 {} \;
+        find {{ app_dest }}/bootstrap/cache -type d -exec chmod 775 {} \;
+
+    #  13. Configure Nginx server block 
+    - name: Write Nginx server block configuration
+      ansible.builtin.shell:
+        cmd: |
+          cat > /etc/nginx/sites-available/laravel << 'NGINXCONF'
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              root /var/www/html/public;
+              index index.php index.html;
+
+              server_name _;
+
+              # Security headers
+              add_header X-Frame-Options "SAMEORIGIN";
+              add_header X-Content-Type-Options "nosniff";
+
+              location / {
+                  try_files $uri $uri/ /index.php?$query_string;
+              }
+
+              location = /favicon.ico { access_log off; log_not_found off; }
+              location = /robots.txt  { access_log off; log_not_found off; }
+
+              error_page 404 /index.php;
+
+              location ~ \.php$ {
+                  fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+                  fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+                  include fastcgi_params;
+                  fastcgi_hide_header X-Powered-By;
+              }
+
+              location ~ /\.(?!well-known).* {
+                  deny all;
+              }
+          }
+          NGINXCONF
+
+    - name: Enable Laravel site in Nginx
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/laravel
+        dest: /etc/nginx/sites-enabled/laravel
+        state: link
+
+    - name: Remove Nginx default site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    #  14. Validate Nginx configuration before reloading 
+    - name: Validate Nginx configuration syntax
+      ansible.builtin.command:
+        cmd: nginx -t
+      register: nginx_test
+      changed_when: false
+      failed_when: nginx_test.rc != 0
+
+    - name: Reload Nginx to apply new configuration
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
+
+    #  15. Ensure services are running 
+    - name: Ensure PHP-FPM is running
+      ansible.builtin.service:
+        name: "php{{ php_version }}-fpm"
+        state: started
+        enabled: true
+
+    - name: Ensure Nginx is running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    #  16. Run Laravel artisan optimizations 
+    - name: Clear Laravel caches
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+        chdir: "{{ app_dest }}"
+      loop:
+        - php artisan config:clear
+        - php artisan route:clear
+        - php artisan view:clear
+      become_user: "{{ nginx_user }}"
+      ignore_errors: true
+
+    - name: Cache Laravel config and routes for production
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+        chdir: "{{ app_dest }}"
+      loop:
+        - php artisan config:cache
+        - php artisan route:cache
+        - php artisan view:cache
+      become_user: "{{ nginx_user }}"
+      ignore_errors: true

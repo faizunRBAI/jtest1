@@ -77,9 +77,6 @@
           - "php{{ php_version }}-bcmath"
           - "php{{ php_version }}-curl"
           - "php{{ php_version }}-zip"
-          - "php{{ php_version }}-tokenizer"
-          - "php{{ php_version }}-json"
-          - "php{{ php_version }}-pdo"
         state: present
       notify: Restart php-fpm
 

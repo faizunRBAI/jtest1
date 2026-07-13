@@ -131,7 +131,7 @@
     #  9. Install Composer dependencies 
     - name: Install Composer dependencies (production)
       ansible.builtin.command:
-        cmd: composer install --no-dev --no-interaction --optimize-autoloader --no-progress --no-audit
+        cmd: composer install --no-dev --no-interaction --optimize-autoloader --no-progress
         chdir: "{{ app_dest }}"
       environment:
         COMPOSER_ALLOW_SUPERUSER: "1"
